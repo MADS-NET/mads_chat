@@ -28,7 +28,7 @@ The app subscribes to all topics.
 
 Finally, we have buttons to connect/disconnect from the broker. Disconnect shall be automatically called upon exit.
 
-Use the `agent.hpp` header and the `Mads::Agent` class for connecting and dealing with publish/subscribe.
+Use the `agent.hpp` header and the `Mads::Agent` class (namely `Mads::start_agent`, `Mads::connect`, `Mads::disconnect`, `Mads::publish`, `Mads::receive`), for connecting and dealing with publish/subscribe.
 
 Values entered in this section shall be saved/restored upon relaunch, i.e. connection details shall be persisted (using the `imgui.ini` file is fine, or if not possible a JSON file saved in the working directory).
 
