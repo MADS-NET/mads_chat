@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(mads_multitool LANGUAGES CXX)
+if(POLICY CMP0169)
+  cmake_policy(SET CMP0169 OLD)
+endif()
+
+project(mads_chat LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -57,7 +61,7 @@ FetchContent_Declare(
 FetchContent_Declare(
   imgui
   GIT_REPOSITORY https://github.com/ocornut/imgui.git
-  GIT_TAG v1.91.9b
+  GIT_TAG v1.92.6
 )
 
 FetchContent_Declare(
@@ -66,20 +70,26 @@ FetchContent_Declare(
   GIT_TAG 0.1.0
 )
 
+FetchContent_Declare(
+  imgui_color_text_edit
+  GIT_REPOSITORY https://github.com/goossens/ImGuiColorTextEdit.git
+  GIT_TAG master
+)
+
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(glfw)
-
-FetchContent_GetProperties(imgui)
-if(NOT imgui_POPULATED)
-  FetchContent_Populate(imgui)
-endif()
+FetchContent_MakeAvailable(glfw imgui)
 
 FetchContent_GetProperties(portable_file_dialogs)
 if(NOT portable_file_dialogs_POPULATED)
   FetchContent_Populate(portable_file_dialogs)
+endif()
+
+FetchContent_GetProperties(imgui_color_text_edit)
+if(NOT imgui_color_text_edit_POPULATED)
+  FetchContent_Populate(imgui_color_text_edit)
 endif()
 
 add_library(imgui_lib STATIC
@@ -97,6 +107,12 @@ target_include_directories(imgui_lib
     ${imgui_SOURCE_DIR}/backends
 )
 
+if(WIN32)
+
+else()
+  add_compile_options(-Wno-deprecated-literal-operator)
+endif()
+
 target_link_libraries(imgui_lib PUBLIC glfw)
 
 find_package(OpenGL REQUIRED)
@@ -111,16 +127,18 @@ endif()
 add_library(portable_file_dialogs INTERFACE)
 target_include_directories(portable_file_dialogs INTERFACE ${portable_file_dialogs_SOURCE_DIR})
 
-add_executable(mads_multitool
+add_executable(mads_chat
   src/main.cpp
+  ${imgui_color_text_edit_SOURCE_DIR}/TextEditor.cpp
 )
 
-target_include_directories(mads_multitool
+target_include_directories(mads_chat
   PRIVATE
     ${MADS_INCLUDE_DIR}
+    ${imgui_color_text_edit_SOURCE_DIR}
 )
 
-target_link_libraries(mads_multitool
+target_link_libraries(mads_chat
   PRIVATE
     imgui_lib
     portable_file_dialogs
@@ -128,12 +146,12 @@ target_link_libraries(mads_multitool
 )
 
 if(APPLE)
-  target_link_libraries(mads_multitool PRIVATE "-framework Cocoa" "-framework IOKit" "-framework CoreVideo")
+  target_link_libraries(mads_chat PRIVATE "-framework Cocoa" "-framework IOKit" "-framework CoreVideo")
 elseif(WIN32)
-  target_link_libraries(mads_multitool PRIVATE comdlg32 ole32 shell32)
+  target_link_libraries(mads_chat PRIVATE comdlg32 ole32 shell32)
 else()
   find_package(Threads REQUIRED)
-  target_link_libraries(mads_multitool PRIVATE Threads::Threads)
+  target_link_libraries(mads_chat PRIVATE Threads::Threads)
 endif()
 
-target_compile_definitions(mads_multitool PRIVATE IMGUI_DEFINE_MATH_OPERATORS)
+target_compile_definitions(mads_chat PRIVATE IMGUI_DEFINE_MATH_OPERATORS)

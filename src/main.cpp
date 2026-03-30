@@ -5,6 +5,10 @@
 #include <GLFW/glfw3.h>
 #include <nlohmann/json.hpp>
 #include <portable-file-dialogs.h>
+#include <TextEditor.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
 
 #include <agent.hpp>
 
@@ -12,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -32,13 +37,21 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char *kWindowTitle = "MADS Multitool";
-constexpr const char *kAppAgentName = "mads_multitool";
-constexpr const char *kSettingsFileName = "mads_multitool_settings.json";
+constexpr const char *kWindowTitle = "MADS Chat";
+constexpr const char *kAppAgentName = "mads_chat";
+constexpr const char *kSettingsFileName = "mads_chat_settings.json";
+
+struct TextureHandle {
+  unsigned int id = 0;
+  int width = 0;
+  int height = 0;
+};
 
 struct AppSettings {
   std::string host = "localhost";
-  int port = 9092;
+  int pub_port = 9090;
+  int sub_port = 9091;
+  std::string subscribe_topics = "";
   std::string client_private_key_path;
   std::string broker_public_key_path;
 };
@@ -82,8 +95,91 @@ ImVec4 color_null() {
   return ImVec4(0.65F, 0.65F, 0.65F, 1.0F);
 }
 
-std::string synthesize_settings_uri(const AppSettings &settings) {
-  return "tcp://" + settings.host + ":" + std::to_string(settings.port);
+std::string make_endpoint_uri(const std::string &host, int port) {
+  return "tcp://" + host + ":" + std::to_string(port);
+}
+
+std::string run_command_capture(const char *command) {
+#if defined(_WIN32)
+  FILE *pipe = _popen(command, "r");
+#else
+  FILE *pipe = popen(command, "r");
+#endif
+  if (pipe == nullptr) {
+    return {};
+  }
+
+  std::array<char, 256> buffer{};
+  std::string output;
+  while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+    output += buffer.data();
+  }
+
+#if defined(_WIN32)
+  _pclose(pipe);
+#else
+  pclose(pipe);
+#endif
+
+  while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+    output.pop_back();
+  }
+  return output;
+}
+
+TextureHandle load_texture_from_png(const fs::path &path) {
+  TextureHandle texture;
+  int channels = 0;
+  unsigned char *pixels = stbi_load(path.string().c_str(), &texture.width, &texture.height, &channels, STBI_rgb_alpha);
+  if (pixels == nullptr) {
+    return texture;
+  }
+
+  glGenTextures(1, &texture.id);
+  glBindTexture(GL_TEXTURE_2D, texture.id);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  glTexImage2D(GL_TEXTURE_2D,
+               0,
+               GL_RGBA,
+               texture.width,
+               texture.height,
+               0,
+               GL_RGBA,
+               GL_UNSIGNED_BYTE,
+               pixels);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  stbi_image_free(pixels);
+  return texture;
+}
+
+std::string trim_copy(std::string value) {
+  const auto first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) {
+    return {};
+  }
+  const auto last = value.find_last_not_of(" \t\r\n");
+  return value.substr(first, last - first + 1);
+}
+
+std::vector<std::string> parse_subscribe_topics(const std::string &raw_topics) {
+  std::vector<std::string> topics;
+  std::stringstream stream(raw_topics);
+  std::string item;
+  while (std::getline(stream, item, ',')) {
+    item = trim_copy(std::move(item));
+    if (!item.empty()) {
+      topics.push_back(std::move(item));
+    }
+  }
+
+  if (topics.empty()) {
+    topics.push_back("");
+  }
+  return topics;
 }
 
 std::string read_file(const fs::path &path) {
@@ -115,7 +211,9 @@ std::optional<AppSettings> load_settings(const fs::path &path) {
     const json parsed = json::parse(raw);
     AppSettings settings;
     settings.host = parsed.value("host", settings.host);
-    settings.port = parsed.value("port", settings.port);
+    settings.sub_port = parsed.value("sub_port", settings.sub_port);
+    settings.pub_port = parsed.value("pub_port", settings.pub_port);
+    settings.subscribe_topics = parsed.value("subscribe_topics", settings.subscribe_topics);
     settings.client_private_key_path = parsed.value("client_private_key_path", std::string{});
     settings.broker_public_key_path = parsed.value("broker_public_key_path", std::string{});
     return settings;
@@ -127,7 +225,9 @@ std::optional<AppSettings> load_settings(const fs::path &path) {
 void save_settings(const fs::path &path, const AppSettings &settings) {
   const json serialized = {
       {"host", settings.host},
-      {"port", settings.port},
+      {"sub_port", settings.sub_port},
+      {"pub_port", settings.pub_port},
+      {"subscribe_topics", settings.subscribe_topics},
       {"client_private_key_path", settings.client_private_key_path},
       {"broker_public_key_path", settings.broker_public_key_path},
   };
@@ -322,7 +422,6 @@ public:
   }
 
   bool connect(const AppSettings &settings) {
-    disconnect();
     clear_error();
 
     try {
@@ -333,8 +432,11 @@ public:
         set_error("Both key files must be selected to enable CURVE.");
         return false;
       }
-
-      std::map<std::string, std::string> crypto_settings;
+      
+      if (_agent == nullptr) {
+        _agent = std::make_unique<Mads::Agent>(kAppAgentName, "none");
+      }
+      
       if (use_crypto) {
         const fs::path client_key_path = fs::path(settings.client_private_key_path);
         const fs::path broker_key_path = fs::path(settings.broker_public_key_path);
@@ -346,57 +448,70 @@ public:
           set_error("MADS expects client and broker keys in the same directory.");
           return false;
         }
-
-        crypto_settings["key_dir"] = client_key_path.parent_path().string();
-        crypto_settings["key_client"] = client_key_path.stem().string();
-        crypto_settings["key_broker"] = broker_key_path.stem().string();
+        _agent->set_key_dir(client_key_path.parent_path().string());
+        _agent->client_key_name = client_key_path.stem().string();
+        _agent->server_key_name = broker_key_path.stem().string();
       }
 
-      agent_ = Mads::start_agent(kAppAgentName, synthesize_settings_uri(settings), crypto_settings);
-      agent_->set_high_watermark(1);
-      agent_->set_receive_timeout(std::chrono::milliseconds(50));
+      if (!_initialized) {
+        _agent->init();
+        _initialized = true;
+      }
+      _agent->set_sub_topic(parse_subscribe_topics(settings.subscribe_topics));
+      _agent->set_sub_endpoint(make_endpoint_uri(settings.host, settings.sub_port));
+      _agent->set_pub_endpoint(make_endpoint_uri(settings.host, settings.pub_port));
+      _agent->set_receive_timeout(std::chrono::milliseconds(50));
+      _agent->connect();
 
-      stop_requested_.store(false);
-      receive_thread_ = std::thread(&MadsBridge::receive_loop, this);
-      connected_.store(true);
+      if (!_receive_thread.joinable()) {
+        _stop_requested.store(false);
+        _receive_thread = std::thread(&MadsBridge::receive_loop, this);
+      }
+      _connected.store(true);
+      _ever_connected.store(true);
       return true;
     } catch (const std::exception &error) {
       set_error(error.what());
-      agent_.reset();
-      connected_.store(false);
+      _connected.store(false);
       return false;
     }
   }
 
   void disconnect() {
-    stop_requested_.store(true);
-    if (receive_thread_.joinable()) {
-      receive_thread_.join();
+    _stop_requested.store(true);
+    if (_receive_thread.joinable()) {
+      _receive_thread.join();
     }
 
-    if (agent_ != nullptr) {
+    if (_agent != nullptr) {
       try {
-        agent_->disconnect();
+        _agent->disconnect();
       } catch (...) {
       }
-      agent_.reset();
+      _agent.reset();
     }
 
-    connected_.store(false);
+    clear_topics();
+    _connected.store(false);
+    _initialized = false;
   }
 
   bool is_connected() const {
-    return connected_.load();
+    return _connected.load();
+  }
+
+  bool has_connected_once() const {
+    return _ever_connected.load();
   }
 
   bool publish_message(const std::string &topic, const std::string &payload) {
-    if (agent_ == nullptr) {
+    if (_agent == nullptr) {
       set_error("Not connected.");
       return false;
     }
 
     try {
-      agent_->publish(json::parse(payload), topic);
+      _agent->publish(json::parse(payload), topic);
       clear_error();
       return true;
     } catch (const std::exception &error) {
@@ -406,44 +521,44 @@ public:
   }
 
   std::map<std::string, TopicState> snapshot_topics() const {
-    std::scoped_lock lock(mutex_);
-    return topics_;
+    std::scoped_lock lock(_mutex);
+    return _topics;
   }
 
   void clear_topics() {
-    std::scoped_lock lock(mutex_);
-    topics_.clear();
+    std::scoped_lock lock(_mutex);
+    _topics.clear();
   }
 
   void set_topic_expanded(const std::string &topic, bool expanded) {
-    std::scoped_lock lock(mutex_);
-    if (auto it = topics_.find(topic); it != topics_.end()) {
+    std::scoped_lock lock(_mutex);
+    if (auto it = _topics.find(topic); it != _topics.end()) {
       it->second.expanded = expanded;
     }
   }
 
   std::string last_error() const {
-    std::scoped_lock lock(mutex_);
-    return last_error_;
+    std::scoped_lock lock(_mutex);
+    return _last_error;
   }
 
 private:
   void receive_loop() {
-    while (!stop_requested_.load()) {
+    while (!_stop_requested.load()) {
       try {
-        if (agent_ == nullptr) {
+        if (_agent == nullptr) {
           return;
         }
 
-        const Mads::message_type message_type = agent_->receive(true);
+        const Mads::message_type message_type = _agent->receive(true);
         if (message_type == Mads::message_type::json) {
-          const auto [topic, payload] = agent_->last_message();
+          const auto [topic, payload] = _agent->last_message();
           bool valid = false;
           json parsed;
           const std::string pretty = format_json(payload, &valid, &parsed);
           {
-            std::scoped_lock lock(mutex_);
-            TopicState &state = topics_[topic];
+            std::scoped_lock lock(_mutex);
+            TopicState &state = _topics[topic];
             state.payload = pretty;
             state.last_received_at = std::chrono::steady_clock::now();
             state.json_valid = valid;
@@ -462,22 +577,24 @@ private:
   }
 
   void set_error(std::string message) {
-    std::scoped_lock lock(mutex_);
-    last_error_ = std::move(message);
+    std::scoped_lock lock(_mutex);
+    _last_error = std::move(message);
   }
 
   void clear_error() {
-    std::scoped_lock lock(mutex_);
-    last_error_.clear();
+    std::scoped_lock lock(_mutex);
+    _last_error.clear();
   }
 
-  std::unique_ptr<Mads::Agent> agent_;
-  std::thread receive_thread_;
-  mutable std::mutex mutex_;
-  std::map<std::string, TopicState> topics_;
-  std::string last_error_;
-  std::atomic<bool> connected_{false};
-  std::atomic<bool> stop_requested_{false};
+  std::unique_ptr<Mads::Agent> _agent;
+  std::thread _receive_thread;
+  mutable std::mutex _mutex;
+  std::map<std::string, TopicState> _topics;
+  std::string _last_error;
+  std::atomic<bool> _connected{false};
+  std::atomic<bool> _ever_connected{false};
+  std::atomic<bool> _stop_requested{false};
+  bool _initialized = false;
 };
 
 struct UiState {
@@ -489,9 +606,40 @@ struct UiState {
   std::string status_message;
   bool publish_json_valid = true;
   json parsed_publish_json;
+  TextEditor publish_editor;
   ImFont *monospace_font = nullptr;
   bool settings_dirty = false;
+  std::string mads_version;
+  std::string mads_prefix;
+  TextureHandle logo_texture;
 };
+
+void refresh_publish_validation(UiState &ui_state) {
+  ui_state.publish_buffer = ui_state.publish_editor.GetText();
+  bool valid = false;
+  json parsed;
+  format_json(ui_state.publish_buffer, &valid, &parsed);
+  ui_state.publish_json_valid = valid;
+  ui_state.parsed_publish_json = valid ? parsed : json();
+}
+
+void configure_publish_editor(UiState &ui_state) {
+  ui_state.publish_editor.SetLanguage(TextEditor::Language::Json());
+  ui_state.publish_editor.SetTabSize(2);
+  ui_state.publish_editor.SetInsertSpacesOnTabs(true);
+  ui_state.publish_editor.SetAutoIndentEnabled(true);
+  ui_state.publish_editor.SetShowLineNumbersEnabled(false);
+  ui_state.publish_editor.SetShowScrollbarMiniMapEnabled(false);
+  ui_state.publish_editor.SetShowPanScrollIndicatorEnabled(false);
+  ui_state.publish_editor.SetShowMatchingBrackets(true);
+  ui_state.publish_editor.SetCompletePairedGlyphs(true);
+  ui_state.publish_editor.SetPalette(TextEditor::GetDarkPalette());
+  ui_state.publish_editor.SetText(format_json(ui_state.publish_buffer));
+  ui_state.publish_editor.SetChangeCallback([&ui_state]() {
+    refresh_publish_validation(ui_state);
+  }, 100);
+  refresh_publish_validation(ui_state);
+}
 
 void mark_settings_dirty(UiState &ui_state) {
   ui_state.settings_dirty = true;
@@ -511,20 +659,52 @@ void draw_connection_bar(UiState &ui_state) {
   ImGui::SeparatorText("Connection");
   char host_buffer[256];
   std::snprintf(host_buffer, sizeof(host_buffer), "%s", settings.host.c_str());
-  if (ImGui::InputText("Host", host_buffer, sizeof(host_buffer))) {
+  int sub_port = settings.sub_port;
+  int pub_port = settings.pub_port;
+  char topics_buffer[512];
+  std::snprintf(topics_buffer, sizeof(topics_buffer), "%s", settings.subscribe_topics.c_str());
+
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted("Host:");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(220.0F);
+  if (ImGui::InputText("##host", host_buffer, sizeof(host_buffer))) {
     settings.host = host_buffer;
     mark_settings_dirty(ui_state);
   }
 
   ImGui::SameLine();
-  int port = settings.port;
-  if (ImGui::InputInt("Port", &port, 0, 0)) {
-    settings.port = std::max(port, 0);
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted("Sub port:");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(110.0F);
+  if (ImGui::InputInt("##sub_port", &sub_port, 0, 0)) {
+    settings.sub_port = std::max(sub_port, 0);
     mark_settings_dirty(ui_state);
   }
 
   ImGui::SameLine();
-  ImGui::TextDisabled("URI: %s", synthesize_settings_uri(settings).c_str());
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted("Pub port:");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(110.0F);
+  if (ImGui::InputInt("##pub_port", &pub_port, 0, 0)) {
+    settings.pub_port = std::max(pub_port, 0);
+    mark_settings_dirty(ui_state);
+  }
+
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted("Subscribe topics:");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  if (ImGui::InputText("##subscribe_topics", topics_buffer, sizeof(topics_buffer))) {
+    settings.subscribe_topics = topics_buffer;
+    mark_settings_dirty(ui_state);
+  }
+
+  ImGui::TextDisabled("Sub URI: %s", make_endpoint_uri(settings.host, settings.sub_port).c_str());
+  ImGui::SameLine();
+  ImGui::TextDisabled("Pub URI: %s", make_endpoint_uri(settings.host, settings.pub_port).c_str());
 
   if (ImGui::Button("Client Private Key")) {
     const auto result = pfd::open_file("Select client private key", ".", {"Private key", "*.key"}, pfd::opt::none).result();
@@ -546,18 +726,15 @@ void draw_connection_bar(UiState &ui_state) {
   ImGui::SameLine();
   ImGui::TextUnformatted(settings.broker_public_key_path.empty() ? "(none)" : settings.broker_public_key_path.c_str());
 
-  if (!ui_state.bridge.is_connected()) {
-    if (ImGui::Button("Connect")) {
-      if (ui_state.bridge.connect(settings)) {
-        ui_state.status_message = "Connected.";
-      } else {
-        ui_state.status_message = "Connect failed.";
-      }
-      persist_settings_if_needed(ui_state);
+  const char *connect_label = ui_state.bridge.has_connected_once() ? "Reconnect" : "Connect";
+  if (ImGui::Button(connect_label)) {
+    const bool was_connected = ui_state.bridge.is_connected();
+    if (ui_state.bridge.connect(settings)) {
+      ui_state.status_message = was_connected ? "Reconnected." : "Connected.";
+    } else {
+      ui_state.status_message = was_connected ? "Reconnect failed." : "Connect failed.";
     }
-  } else if (ImGui::Button("Disconnect")) {
-    ui_state.bridge.disconnect();
-    ui_state.status_message = "Disconnected.";
+    persist_settings_if_needed(ui_state);
   }
 
   ImGui::SameLine();
@@ -582,37 +759,10 @@ void draw_publish_panel(UiState &ui_state) {
     ui_state.publish_topic = topic_buffer;
   }
 
-  bool valid = false;
-  json parsed;
-  const std::string formatted = format_json(ui_state.publish_buffer, &valid, &parsed);
-  ui_state.publish_json_valid = valid;
-  ui_state.parsed_publish_json = valid ? parsed : json();
-
-  if (ImGui::IsWindowAppearing() && valid) {
-    ui_state.publish_buffer = formatted;
-  }
-
   if (ui_state.monospace_font != nullptr) {
     ImGui::PushFont(ui_state.monospace_font);
   }
-
-  std::vector<char> editor_buffer(ui_state.publish_buffer.begin(), ui_state.publish_buffer.end());
-  editor_buffer.resize(std::max<size_t>(editor_buffer.size() + 1024U, 4096U), '\0');
-  const bool edited = ImGui::InputTextMultiline("##publish_json",
-                                                editor_buffer.data(),
-                                                editor_buffer.size(),
-                                                ImVec2(-FLT_MIN, 180.0F),
-                                                ImGuiInputTextFlags_AllowTabInput);
-  if (edited) {
-    ui_state.publish_buffer = std::string(editor_buffer.data());
-  }
-  if (ImGui::IsItemDeactivatedAfterEdit()) {
-    bool deactivated_valid = false;
-    const std::string pretty = format_json(ui_state.publish_buffer, &deactivated_valid);
-    if (deactivated_valid) {
-      ui_state.publish_buffer = pretty;
-    }
-  }
+  ui_state.publish_editor.Render("##publish_json_editor", ImVec2(-FLT_MIN, 260.0F), true);
 
   if (ui_state.monospace_font != nullptr) {
     ImGui::PopFont();
@@ -646,11 +796,15 @@ void draw_publish_panel(UiState &ui_state) {
     ImGui::EndDisabled();
   }
 
-  ImGui::SeparatorText("Colored Preview");
-  if (ui_state.publish_json_valid) {
-    render_json_view(ui_state.parsed_publish_json, ImVec2(-FLT_MIN, 220.0F));
-  } else {
-    render_invalid_json_view(ui_state.publish_buffer, ImVec2(-FLT_MIN, 220.0F));
+  if (ImGui::Button("Format JSON")) {
+    if (ui_state.publish_json_valid) {
+      const std::string pretty = format_json(ui_state.publish_buffer);
+      ui_state.publish_editor.SetText(pretty);
+      refresh_publish_validation(ui_state);
+      ui_state.status_message = "JSON formatted.";
+    } else {
+      ui_state.status_message = "Cannot format invalid JSON.";
+    }
   }
 }
 
@@ -693,6 +847,37 @@ void draw_receive_panel(UiState &ui_state) {
   if (ImGui::Button("Clear Topics")) {
     ui_state.bridge.clear_topics();
   }
+}
+
+void draw_status_footer(UiState &ui_state) {
+  ImGui::Separator();
+  const float line_height = ImGui::GetTextLineHeightWithSpacing();
+  const float image_height = line_height * 2.0F;
+  const float content_height = std::max(image_height, line_height * 2.0F);
+  const float footer_height = content_height + ImGui::GetStyle().FramePadding.y * 4.0F;
+  ImGui::BeginChild("status_footer", ImVec2(-FLT_MIN, footer_height), false, ImGuiWindowFlags_NoScrollbar);
+
+  if (ui_state.logo_texture.id != 0 && ui_state.logo_texture.width > 0 && ui_state.logo_texture.height > 0) {
+    const float image_width = image_height * static_cast<float>(ui_state.logo_texture.width) /
+                              static_cast<float>(ui_state.logo_texture.height);
+    ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(ui_state.logo_texture.id)),
+                 ImVec2(image_width, image_height));
+    ImGui::SameLine();
+  }
+
+  ImGui::BeginGroup();
+  ImGui::Text("Version: %s", ui_state.mads_version.empty() ? "(unavailable)" : ui_state.mads_version.c_str());
+  ImGui::Text("Prefix: %s", ui_state.mads_prefix.empty() ? "(unavailable)" : ui_state.mads_prefix.c_str());
+  ImGui::EndGroup();
+
+  ImGui::EndChild();
+}
+
+float get_status_footer_height() {
+  const float line_height = ImGui::GetTextLineHeightWithSpacing();
+  const float image_height = line_height * 2.0F;
+  const float content_height = std::max(image_height, line_height * 2.0F);
+  return content_height + ImGui::GetStyle().FramePadding.y * 4.0F + ImGui::GetStyle().ItemSpacing.y;
 }
 
 } // namespace
@@ -748,6 +933,12 @@ int main() {
     ui_state.connection_settings = *stored;
   }
   ui_state.monospace_font = load_monospace_font(15.0F);
+  ui_state.mads_version = run_command_capture("mads --version");
+  ui_state.mads_prefix = run_command_capture("mads --prefix");
+  if (!ui_state.mads_prefix.empty()) {
+    ui_state.logo_texture = load_texture_from_png(fs::path(ui_state.mads_prefix) / "share/images/logo_white.png");
+  }
+  configure_publish_editor(ui_state);
 
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -767,15 +958,21 @@ int main() {
     ImGui::Begin("MainWindow", nullptr, window_flags);
     draw_connection_bar(ui_state);
 
-    if (ImGui::BeginTable("main_split", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
-      ImGui::TableNextColumn();
-      draw_publish_panel(ui_state);
+    const float footer_reserved_height = get_status_footer_height();
+    if (ImGui::BeginChild("content_area", ImVec2(-FLT_MIN, -footer_reserved_height), false)) {
+      if (ImGui::BeginTable("main_split", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableNextColumn();
+        draw_publish_panel(ui_state);
 
-      ImGui::TableNextColumn();
-      draw_receive_panel(ui_state);
+        ImGui::TableNextColumn();
+        draw_receive_panel(ui_state);
 
-      ImGui::EndTable();
+        ImGui::EndTable();
+      }
     }
+    ImGui::EndChild();
+
+    draw_status_footer(ui_state);
     ImGui::End();
 
     persist_settings_if_needed(ui_state);
@@ -793,6 +990,9 @@ int main() {
 
   ui_state.bridge.disconnect();
   save_settings(ui_state.settings_path, ui_state.connection_settings);
+  if (ui_state.logo_texture.id != 0) {
+    glDeleteTextures(1, &ui_state.logo_texture.id);
+  }
 
   ImGui_ImplOpenGL3_Shutdown();
   ImGui_ImplGlfw_Shutdown();
