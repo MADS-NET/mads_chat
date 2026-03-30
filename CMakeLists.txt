@@ -6,6 +6,10 @@ endif()
 
 project(mads_chat LANGUAGES CXX)
 
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -30,8 +34,14 @@ endif()
 
 set(MADS_ROOT "${MADS_ROOT_FROM_TOOL}" CACHE PATH "Path to the MADS installation root")
 
+set(MADS_INSTALL_PREFIX_FROM_TOOL "${MADS_ROOT_FROM_TOOL}")
+
 if(NOT MADS_ROOT)
   message(FATAL_ERROR "MADS_ROOT is empty. Set -DMADS_ROOT=/path/to/mads or ensure `mads -p` works.")
+endif()
+
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "${MADS_INSTALL_PREFIX_FROM_TOOL}" CACHE PATH "Install prefix" FORCE)
 endif()
 
 set(MADS_INCLUDE_DIR "${MADS_ROOT}/include")
@@ -52,6 +62,7 @@ if(NOT EXISTS "${MADS_LIBRARY}")
   message(FATAL_ERROR "Could not find MADS library at ${MADS_LIBRARY}")
 endif()
 
+set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   glfw
   GIT_REPOSITORY https://github.com/glfw/glfw.git
@@ -127,18 +138,18 @@ endif()
 add_library(portable_file_dialogs INTERFACE)
 target_include_directories(portable_file_dialogs INTERFACE ${portable_file_dialogs_SOURCE_DIR})
 
-add_executable(mads_chat
+add_executable(mads-chat
   src/main.cpp
   ${imgui_color_text_edit_SOURCE_DIR}/TextEditor.cpp
 )
 
-target_include_directories(mads_chat
+target_include_directories(mads-chat
   PRIVATE
     ${MADS_INCLUDE_DIR}
     ${imgui_color_text_edit_SOURCE_DIR}
 )
 
-target_link_libraries(mads_chat
+target_link_libraries(mads-chat
   PRIVATE
     imgui_lib
     portable_file_dialogs
@@ -146,12 +157,29 @@ target_link_libraries(mads_chat
 )
 
 if(APPLE)
-  target_link_libraries(mads_chat PRIVATE "-framework Cocoa" "-framework IOKit" "-framework CoreVideo")
-elseif(WIN32)
-  target_link_libraries(mads_chat PRIVATE comdlg32 ole32 shell32)
-else()
-  find_package(Threads REQUIRED)
-  target_link_libraries(mads_chat PRIVATE Threads::Threads)
+  set_target_properties(mads-chat PROPERTIES
+    BUILD_RPATH "${MADS_ROOT}/lib"
+    INSTALL_RPATH "@executable_path/../lib;${MADS_ROOT}/lib"
+  )
+elseif(UNIX)
+  set_target_properties(mads-chat PROPERTIES
+    BUILD_RPATH "${MADS_ROOT}/lib"
+    INSTALL_RPATH "$ORIGIN/../lib;${MADS_ROOT}/lib"
+  )
 endif()
 
-target_compile_definitions(mads_chat PRIVATE IMGUI_DEFINE_MATH_OPERATORS)
+if(APPLE)
+  target_link_libraries(mads-chat PRIVATE "-framework Cocoa" "-framework IOKit" "-framework CoreVideo")
+elseif(WIN32)
+  target_link_libraries(mads-chat PRIVATE comdlg32 ole32 shell32)
+else()
+  find_package(Threads REQUIRED)
+  target_link_libraries(mads-chat PRIVATE Threads::Threads)
+endif()
+
+target_compile_definitions(mads-chat PRIVATE IMGUI_DEFINE_MATH_OPERATORS)
+
+install(TARGETS mads-chat
+  RUNTIME DESTINATION bin
+  BUNDLE DESTINATION bin
+)
