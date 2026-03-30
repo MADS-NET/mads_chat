@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_regex: Linux-x86_64\\.tar\\.gz$
+            asset_name: mads-linux.tar.gz
+          - os: macos-latest
+            asset_regex: Darwin-universal\\.sh$
+            asset_name: mads-macos.sh
+          - os: windows-latest
+            asset_regex: Windows-AMD64\\.exe$
+            asset_name: mads-windows.exe
+
+    env:
+      APP_PREFIX: ${{ github.workspace }}/app-prefix
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libcurl4-openssl-dev \
+            libgl1-mesa-dev \
+            libssl-dev \
+            xorg-dev
+
+      - name: Resolve latest MADS release asset
+        id: release_asset
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const release = await github.rest.repos.getLatestRelease({
+              owner: 'pbosetti',
+              repo: 'MADS'
+            });
+            const pattern = new RegExp(process.env.ASSET_REGEX);
+            const asset = release.data.assets.find((item) => pattern.test(item.name));
+            if (!asset) {
+              core.setFailed(`No release asset matched ${process.env.ASSET_REGEX}`);
+              return;
+            }
+            core.setOutput('url', asset.browser_download_url);
+            core.setOutput('name', asset.name);
+        env:
+          ASSET_REGEX: ${{ matrix.asset_regex }}
+
+      - name: Download MADS release asset
+        shell: bash
+        run: |
+          curl -fsSL "${{ steps.release_asset.outputs.url }}" -o "${{ matrix.asset_name }}"
+
+      - name: Install MADS on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          tar -xzf "${{ matrix.asset_name }}" -C "$GITHUB_WORKSPACE"
+          echo "$GITHUB_WORKSPACE/usr/local/bin" >> "$GITHUB_PATH"
+
+      - name: Install MADS on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          chmod +x "${{ matrix.asset_name }}"
+          "./${{ matrix.asset_name }}" --prefix="$GITHUB_WORKSPACE" --skip-license --exclude-subdir
+          echo "$GITHUB_WORKSPACE/usr/local/bin" >> "$GITHUB_PATH"
+
+      - name: Install MADS on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "${{ matrix.asset_name }}" -ArgumentList "/S" -Wait
+          "C:\Program Files\MADS\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Detect MADS prefix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          echo "MADS_ROOT=$(mads -p)" >> "$GITHUB_ENV"
+
+      - name: Detect MADS prefix on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $prefix = & mads -p
+          "MADS_ROOT=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure mads-chat
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DMADS_ROOT="${{ env.MADS_ROOT }}"
+          -DCMAKE_INSTALL_PREFIX="${{ env.APP_PREFIX }}"
+
+      - name: Build mads-chat
+        run: cmake --build build --config Release
+
+      - name: Install mads-chat
+        run: cmake --install build --config Release
