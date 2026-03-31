@@ -32,6 +32,10 @@
 #include <utility>
 #include <vector>
 
+#if !defined(LIB_VERSION_NUM) || LIB_VERSION_NUM < VERSION_ENCODE(2, 0, 3)
+#error "MADS Chat expects MADS C++ library version 2.0.3 or later."
+#endif
+
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
