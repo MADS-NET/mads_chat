@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <cmath>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -64,9 +65,17 @@ struct AppSettings {
 struct TopicState {
   std::string payload;
   std::chrono::steady_clock::time_point last_received_at = std::chrono::steady_clock::now();
+  std::optional<std::chrono::steady_clock::time_point> previous_received_at;
+  std::vector<double> inter_arrival_seconds;
   bool expanded = false;
   bool json_valid = false;
   json parsed_payload;
+};
+
+struct TopicTimingStats {
+  double mean_seconds = 0.0;
+  double stdev_seconds = 0.0;
+  std::size_t sample_count = 0;
 };
 
 struct JsonSpan {
@@ -98,6 +107,18 @@ ImVec4 color_bool() {
 
 ImVec4 color_null() {
   return ImVec4(0.65F, 0.65F, 0.65F, 1.0F);
+}
+
+ImVec4 color_elapsed_normal() {
+  return ImVec4(0.35F, 0.78F, 0.36F, 1.0F);
+}
+
+ImVec4 color_elapsed_warning() {
+  return ImVec4(0.92F, 0.58F, 0.18F, 1.0F);
+}
+
+ImVec4 color_elapsed_alert() {
+  return ImVec4(0.87F, 0.24F, 0.24F, 1.0F);
 }
 
 std::string make_endpoint_uri(const std::string &host, int port) {
@@ -591,8 +612,19 @@ private:
           {
             std::scoped_lock lock(_mutex);
             TopicState &state = _topics[topic];
+            const auto received_at = std::chrono::steady_clock::now();
+            if (state.previous_received_at.has_value()) {
+              const double interval_seconds =
+                  std::chrono::duration<double>(received_at - *state.previous_received_at).count();
+              state.inter_arrival_seconds.push_back(interval_seconds);
+              constexpr std::size_t kInterArrivalWindowSize = 10;
+              if (state.inter_arrival_seconds.size() > kInterArrivalWindowSize) {
+                state.inter_arrival_seconds.erase(state.inter_arrival_seconds.begin());
+              }
+            }
             state.payload = pretty;
-            state.last_received_at = std::chrono::steady_clock::now();
+            state.previous_received_at = received_at;
+            state.last_received_at = received_at;
             state.json_valid = valid;
             state.parsed_payload = valid ? parsed : json();
           }
@@ -861,6 +893,53 @@ std::string format_elapsed(std::chrono::steady_clock::time_point time_point) {
   return stream.str();
 }
 
+std::string format_seconds(double seconds) {
+  std::ostringstream stream;
+  stream << std::fixed << std::setprecision(3) << seconds << " s";
+  return stream.str();
+}
+
+TopicTimingStats compute_topic_timing_stats(const TopicState &state) {
+  TopicTimingStats stats;
+  stats.sample_count = state.inter_arrival_seconds.size();
+  if (stats.sample_count == 0) {
+    return stats;
+  }
+
+  double sum = 0.0;
+  for (const double value : state.inter_arrival_seconds) {
+    sum += value;
+  }
+  stats.mean_seconds = sum / static_cast<double>(stats.sample_count);
+
+  double squared_sum = 0.0;
+  for (const double value : state.inter_arrival_seconds) {
+    const double delta = value - stats.mean_seconds;
+    squared_sum += delta * delta;
+  }
+  stats.stdev_seconds = std::sqrt(squared_sum / static_cast<double>(stats.sample_count));
+  return stats;
+}
+
+ImVec4 elapsed_color_for(const TopicTimingStats &stats, double elapsed_seconds) {
+  if (stats.sample_count == 0) {
+    return color_text();
+  }
+
+  if (stats.stdev_seconds <= 0.0) {
+    return elapsed_seconds <= stats.mean_seconds ? color_elapsed_normal() : color_elapsed_alert();
+  }
+
+  const double sigma_distance = (elapsed_seconds - stats.mean_seconds) / stats.stdev_seconds;
+  if (sigma_distance <= 1.5) {
+    return color_elapsed_normal();
+  }
+  if (sigma_distance <= 3.0) {
+    return color_elapsed_warning();
+  }
+  return color_elapsed_alert();
+}
+
 void draw_receive_panel(UiState &ui_state) {
   ImGui::SeparatorText("Receive");
 
@@ -877,7 +956,19 @@ void draw_receive_panel(UiState &ui_state) {
     ImGui::SameLine();
     ImGui::TextUnformatted(topic.c_str());
     ImGui::SameLine();
-    ImGui::TextDisabled("%s", format_elapsed(state.last_received_at).c_str());
+    const double elapsed_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - state.last_received_at).count();
+    const TopicTimingStats stats = compute_topic_timing_stats(state);
+    const std::string elapsed_label = format_seconds(elapsed_seconds);
+    ImGui::TextColored(elapsed_color_for(stats, elapsed_seconds), "%s", elapsed_label.c_str());
+    ImGui::SameLine();
+    if (stats.sample_count > 0) {
+      const std::string stats_label =
+          "(" + format_seconds(stats.mean_seconds) + "±" + format_seconds(stats.stdev_seconds) + ")";
+      ImGui::TextDisabled("%s", stats_label.c_str());
+    } else {
+      ImGui::TextDisabled("(n/a±n/a)");
+    }
 
     if (state.expanded) {
       ImGui::Indent();
