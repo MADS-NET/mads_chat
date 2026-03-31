@@ -56,6 +56,7 @@ struct AppSettings {
   int pub_port = 9090;
   int sub_port = 9091;
   std::string subscribe_topics = "";
+  std::string pub_topic = "";
   std::string client_private_key_path;
   std::string broker_public_key_path;
 };
@@ -218,6 +219,7 @@ std::optional<AppSettings> load_settings(const fs::path &path) {
     settings.sub_port = parsed.value("sub_port", settings.sub_port);
     settings.pub_port = parsed.value("pub_port", settings.pub_port);
     settings.subscribe_topics = parsed.value("subscribe_topics", settings.subscribe_topics);
+    settings.pub_topic = parsed.value("pub_topic", settings.pub_topic);
     settings.client_private_key_path = parsed.value("client_private_key_path", std::string{});
     settings.broker_public_key_path = parsed.value("broker_public_key_path", std::string{});
     return settings;
@@ -232,6 +234,7 @@ void save_settings(const fs::path &path, const AppSettings &settings) {
       {"sub_port", settings.sub_port},
       {"pub_port", settings.pub_port},
       {"subscribe_topics", settings.subscribe_topics},
+      {"pub_topic", settings.pub_topic},
       {"client_private_key_path", settings.client_private_key_path},
       {"broker_public_key_path", settings.broker_public_key_path},
   };
@@ -377,17 +380,42 @@ void render_json_lines(const std::vector<JsonLine> &lines) {
   }
 }
 
-void render_json_view(const json &value, const ImVec2 &size) {
+float calculate_child_height(size_t line_count) {
+  const float line_height = ImGui::GetTextLineHeightWithSpacing();
+  const float vertical_padding = ImGui::GetStyle().WindowPadding.y * 2.0F;
+  return std::max(line_height + vertical_padding, static_cast<float>(line_count) * line_height + vertical_padding);
+}
+
+size_t count_lines(std::string_view text) {
+  if (text.empty()) {
+    return 1U;
+  }
+
+  size_t lines = 1U;
+  for (char ch : text) {
+    if (ch == '\n') {
+      ++lines;
+    }
+  }
+  return lines;
+}
+
+void render_json_view(const char *id, const json &value) {
   std::vector<JsonLine> lines;
   lines.reserve(64);
   build_json_lines(value, 0, lines);
-  ImGui::BeginChild(ImGui::GetID("json_view"), size, true, ImGuiWindowFlags_HorizontalScrollbar);
+  ImGui::BeginChild(id,
+                    ImVec2(-FLT_MIN, calculate_child_height(lines.size())),
+                    true,
+                    ImGuiWindowFlags_HorizontalScrollbar);
   render_json_lines(lines);
   ImGui::EndChild();
 }
 
-void render_invalid_json_view(const std::string &raw, const ImVec2 &size) {
-  ImGui::BeginChild(ImGui::GetID("json_view_invalid"), size, true, ImGuiWindowFlags_HorizontalScrollbar);
+void render_invalid_json_view(const char *id, const std::string &raw) {
+  const float height =
+      calculate_child_height(count_lines(raw) + 2U);
+  ImGui::BeginChild(id, ImVec2(-FLT_MIN, height), true, ImGuiWindowFlags_HorizontalScrollbar);
   ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90F, 0.43F, 0.43F, 1.0F));
   ImGui::TextWrapped("Invalid JSON");
   ImGui::PopStyleColor();
@@ -679,21 +707,21 @@ void draw_connection_bar(UiState &ui_state) {
 
   ImGui::SameLine();
   ImGui::AlignTextToFramePadding();
-  ImGui::TextUnformatted("Sub port:");
-  ImGui::SameLine();
-  ImGui::SetNextItemWidth(110.0F);
-  if (ImGui::InputInt("##sub_port", &sub_port, 0, 0)) {
-    settings.sub_port = std::max(sub_port, 0);
-    mark_settings_dirty(ui_state);
-  }
-
-  ImGui::SameLine();
-  ImGui::AlignTextToFramePadding();
   ImGui::TextUnformatted("Pub port:");
   ImGui::SameLine();
   ImGui::SetNextItemWidth(110.0F);
   if (ImGui::InputInt("##pub_port", &pub_port, 0, 0)) {
     settings.pub_port = std::max(pub_port, 0);
+    mark_settings_dirty(ui_state);
+  }
+
+  ImGui::SameLine();
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted("Sub port:");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(110.0F);
+  if (ImGui::InputInt("##sub_port", &sub_port, 0, 0)) {
+    settings.sub_port = std::max(sub_port, 0);
     mark_settings_dirty(ui_state);
   }
 
@@ -755,18 +783,30 @@ void draw_connection_bar(UiState &ui_state) {
 }
 
 void draw_publish_panel(UiState &ui_state) {
+  AppSettings &settings = ui_state.connection_settings;
   ImGui::SeparatorText("Publish");
 
   char topic_buffer[256];
-  std::snprintf(topic_buffer, sizeof(topic_buffer), "%s", ui_state.publish_topic.c_str());
-  if (ImGui::InputText("Topic", topic_buffer, sizeof(topic_buffer))) {
+  std::snprintf(topic_buffer, sizeof(topic_buffer), "%s", settings.pub_topic.c_str());
+  ImGui::TextUnformatted("Publish topic:");
+  ImGui::SameLine();
+  if (ImGui::InputText("##publish_topic", topic_buffer, sizeof(topic_buffer))) {
+    settings.pub_topic = topic_buffer;
     ui_state.publish_topic = topic_buffer;
+    mark_settings_dirty(ui_state);
   }
+
+  const ImGuiStyle &style = ImGui::GetStyle();
+  const float reserved_height =
+      ImGui::GetTextLineHeightWithSpacing() +
+      ImGui::GetFrameHeightWithSpacing() +
+      style.ItemSpacing.y * 2.0F;
+  const float editor_height = std::max(140.0F, ImGui::GetContentRegionAvail().y - reserved_height);
 
   if (ui_state.monospace_font != nullptr) {
     ImGui::PushFont(ui_state.monospace_font);
   }
-  ui_state.publish_editor.Render("##publish_json_editor", ImVec2(-FLT_MIN, 260.0F), true);
+  ui_state.publish_editor.Render("##publish_json_editor", ImVec2(-FLT_MIN, editor_height), true);
 
   if (ui_state.monospace_font != nullptr) {
     ImGui::PopFont();
@@ -782,23 +822,10 @@ void draw_publish_panel(UiState &ui_state) {
     ImGui::PopStyleColor();
   }
 
-  const bool can_publish = !ui_state.publish_topic.empty() &&
+  const bool can_publish = !settings.pub_topic.empty() &&
                            !ui_state.publish_buffer.empty() &&
                            ui_state.publish_json_valid &&
                            ui_state.bridge.is_connected();
-  if (!can_publish) {
-    ImGui::BeginDisabled();
-  }
-  if (ImGui::Button("Publish")) {
-    if (ui_state.bridge.publish_message(ui_state.publish_topic, ui_state.publish_buffer)) {
-      ui_state.status_message = "Message published.";
-    } else {
-      ui_state.status_message = "Publish failed.";
-    }
-  }
-  if (!can_publish) {
-    ImGui::EndDisabled();
-  }
 
   if (ImGui::Button("Format JSON")) {
     if (ui_state.publish_json_valid) {
@@ -809,6 +836,20 @@ void draw_publish_panel(UiState &ui_state) {
     } else {
       ui_state.status_message = "Cannot format invalid JSON.";
     }
+  }
+  ImGui::SameLine();
+  if (!can_publish) {
+    ImGui::BeginDisabled();
+  }
+  if (ImGui::Button("Publish")) {
+    if (ui_state.bridge.publish_message(settings.pub_topic, ui_state.publish_buffer)) {
+      ui_state.status_message = "Message published.";
+    } else {
+      ui_state.status_message = "Publish failed.";
+    }
+  }
+  if (!can_publish) {
+    ImGui::EndDisabled();
   }
 }
 
@@ -826,8 +867,10 @@ void draw_receive_panel(UiState &ui_state) {
   auto topics = ui_state.bridge.snapshot_topics();
   ImGui::BeginChild("receive_topics", ImVec2(-FLT_MIN, -ImGui::GetFrameHeightWithSpacing() * 2.0F), true);
   for (auto &[topic, state] : topics) {
+    ImGui::PushID(topic.c_str());
     const char *toggle_label = state.expanded ? "v" : ">";
-    if (ImGui::SmallButton((std::string(toggle_label) + "##" + topic).c_str())) {
+    const std::string button_label = std::string(toggle_label);
+    if (ImGui::SmallButton(button_label.c_str())) {
       state.expanded = !state.expanded;
       ui_state.bridge.set_topic_expanded(topic, state.expanded);
     }
@@ -839,12 +882,13 @@ void draw_receive_panel(UiState &ui_state) {
     if (state.expanded) {
       ImGui::Indent();
       if (state.json_valid) {
-        render_json_view(state.parsed_payload, ImVec2(-FLT_MIN, 180.0F));
+        render_json_view("json_view", state.parsed_payload);
       } else {
-        render_invalid_json_view(state.payload, ImVec2(-FLT_MIN, 180.0F));
+        render_invalid_json_view("json_view_invalid", state.payload);
       }
       ImGui::Unindent();
     }
+    ImGui::PopID();
   }
   ImGui::EndChild();
 
@@ -936,6 +980,7 @@ int main() {
   if (const auto stored = load_settings(ui_state.settings_path); stored.has_value()) {
     ui_state.connection_settings = *stored;
   }
+  ui_state.publish_topic = ui_state.connection_settings.pub_topic;
   ui_state.monospace_font = load_monospace_font(15.0F);
   ui_state.mads_version = run_command_capture("mads --version");
   ui_state.mads_prefix = run_command_capture("mads --prefix");
@@ -957,7 +1002,9 @@ int main() {
     const ImGuiWindowFlags window_flags =
         ImGuiWindowFlags_NoDecoration |
         ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoSavedSettings;
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse;
 
     ImGui::Begin("MainWindow", nullptr, window_flags);
     draw_connection_bar(ui_state);
