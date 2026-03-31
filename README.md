@@ -91,7 +91,7 @@ After install:
 mads-chat
 ```
 
-or
+or simply:
 
 ```sh
 mads chat
