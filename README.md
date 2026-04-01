@@ -77,6 +77,8 @@ This installs `mads-chat` into:
 
 On macOS and Linux the target is configured with runtime search paths so the installed executable can resolve the MADS core library from the selected MADS prefix.
 
+**NOTE**: on Windows, enable the sudo command in Settings>PowerShell.
+
 ## Run
 
 After build:

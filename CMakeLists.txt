@@ -131,6 +131,8 @@ target_link_libraries(imgui_lib PUBLIC OpenGL::GL)
 
 if(APPLE)
   target_compile_definitions(imgui_lib PUBLIC GL_SILENCE_DEPRECATION IMGUI_IMPL_OPENGL_LOADER_NONE)
+elseif(WIN32)
+  target_compile_definitions(imgui_lib PUBLIC IMGUI_IMPL_OPENGL_LOADER_NONE NOMINMAX WIN32_LEAN_AND_MEAN)
 else()
   target_compile_definitions(imgui_lib PUBLIC IMGUI_IMPL_OPENGL_LOADER_NONE)
 endif()
@@ -178,6 +180,10 @@ else()
 endif()
 
 target_compile_definitions(mads-chat PRIVATE IMGUI_DEFINE_MATH_OPERATORS)
+
+if(WIN32)
+  target_compile_definitions(mads-chat PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
 
 install(TARGETS mads-chat
   RUNTIME DESTINATION bin
