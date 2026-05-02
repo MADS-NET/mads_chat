@@ -25,14 +25,27 @@
 
 #include <agent.hpp>
 
+#if !defined(LIB_VERSION_NUM) || LIB_VERSION_NUM < VERSION_ENCODE(2, 0, 3)
+#error "MADS Chat expects MADS C++ library version 2.0.3 or later."
+#endif
+
+#if defined(LIB_VERSION_NUM) && defined(VERSION_ENCODE) && LIB_VERSION_NUM >= VERSION_ENCODE(2, 1, 0)
+#define MADS_CHAT_HAS_SERVICE_DISCOVERY 1
+#include <service_discovery.hpp>
+#else
+#define MADS_CHAT_HAS_SERVICE_DISCOVERY 0
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -45,10 +58,6 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-
-#if !defined(LIB_VERSION_NUM) || LIB_VERSION_NUM < VERSION_ENCODE(2, 0, 3)
-#error "MADS Chat expects MADS C++ library version 2.0.3 or later."
-#endif
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -90,6 +99,18 @@ struct TopicTimingStats {
   double stdev_seconds = 0.0;
   std::size_t sample_count = 0;
 };
+
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+struct DiscoveredRoom {
+  std::string name;
+  std::string host;
+  int pub_port = -1;
+  int sub_port = -1;
+  bool encrypted = false;
+  std::string hostname;
+  std::string version;
+};
+#endif
 
 struct JsonSpan {
   std::string text;
@@ -203,6 +224,56 @@ std::string trim_copy(std::string value) {
   const auto last = value.find_last_not_of(" \t\r\n");
   return value.substr(first, last - first + 1);
 }
+
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+std::string lower_copy(std::string_view value) {
+  std::string result;
+  result.reserve(value.size());
+  for (const char ch : value) {
+    result.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+  return result;
+}
+
+std::optional<int> find_port(const std::map<std::string, uint16_t> &ports,
+                             std::initializer_list<std::string_view> names) {
+  for (const std::string_view name : names) {
+    const auto exact = ports.find(std::string(name));
+    if (exact != ports.end()) {
+      return static_cast<int>(exact->second);
+    }
+  }
+
+  for (const auto &[key, port] : ports) {
+    const std::string normalized_key = lower_copy(key);
+    for (const std::string_view name : names) {
+      if (normalized_key == lower_copy(name)) {
+        return static_cast<int>(port);
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
+DiscoveredRoom make_discovered_room(const Mads::ServiceDiscovery::ServiceInfo &service) {
+  DiscoveredRoom room;
+  room.name = service.room.empty() ? "(unnamed)" : service.room;
+  room.host = service.ip;
+  room.encrypted = service.encrypted;
+  room.hostname = service.hostname;
+  room.version = service.version;
+
+  if (const auto port = find_port(service.ports, {"frontend", "pub", "publish", "publisher"})) {
+    room.pub_port = *port;
+  }
+  if (const auto port = find_port(service.ports, {"backend", "sub", "subscribe", "subscriber"})) {
+    room.sub_port = *port;
+  }
+
+  return room;
+}
+#endif
 
 std::vector<std::string> parse_subscribe_topics(const std::string &raw_topics) {
   std::vector<std::string> topics;
@@ -674,13 +745,110 @@ private:
   bool _initialized = false;
 };
 
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+class RoomDiscovery {
+public:
+  RoomDiscovery() = default;
+
+  ~RoomDiscovery() {
+    stop();
+  }
+
+  RoomDiscovery(const RoomDiscovery &) = delete;
+  RoomDiscovery &operator=(const RoomDiscovery &) = delete;
+
+  void start() {
+    if (_thread.joinable()) {
+      return;
+    }
+    _stop_requested.store(false);
+    _thread = std::thread(&RoomDiscovery::discovery_loop, this);
+  }
+
+  void stop() {
+    _stop_requested.store(true);
+    if (_thread.joinable()) {
+      _thread.join();
+    }
+  }
+
+  std::vector<DiscoveredRoom> snapshot_rooms() const {
+    std::scoped_lock lock(_mutex);
+    return _rooms;
+  }
+
+  std::string last_error() const {
+    std::scoped_lock lock(_mutex);
+    return _last_error;
+  }
+
+private:
+  void discovery_loop() {
+    try {
+      Mads::ServiceDiscovery discovery(MADS_SERVICE_PORT);
+      while (!_stop_requested.load()) {
+        try {
+          std::vector<DiscoveredRoom> rooms;
+          const auto services = discovery.list_rooms(std::chrono::milliseconds{1000});
+          rooms.reserve(services.size());
+          for (const auto &[name, service] : services) {
+            DiscoveredRoom room = make_discovered_room(service);
+            if (room.name.empty() || room.name == "(unnamed)") {
+              room.name = name.empty() ? "(unnamed)" : name;
+            }
+            rooms.push_back(std::move(room));
+          }
+
+          {
+            std::scoped_lock lock(_mutex);
+            _rooms = std::move(rooms);
+            _last_error.clear();
+          }
+        } catch (const std::exception &error) {
+          set_error(error.what());
+          sleep_in_slices(std::chrono::milliseconds{500});
+        }
+      }
+    } catch (const std::exception &error) {
+      set_error(error.what());
+    }
+  }
+
+  void sleep_in_slices(std::chrono::milliseconds duration) const {
+    constexpr auto kSlice = std::chrono::milliseconds{50};
+    auto slept = std::chrono::milliseconds{0};
+    while (!_stop_requested.load() && slept < duration) {
+      std::this_thread::sleep_for(kSlice);
+      slept += kSlice;
+    }
+  }
+
+  void set_error(std::string message) {
+    std::scoped_lock lock(_mutex);
+    _last_error = std::move(message);
+  }
+
+  std::thread _thread;
+  mutable std::mutex _mutex;
+  std::vector<DiscoveredRoom> _rooms;
+  std::string _last_error;
+  std::atomic<bool> _stop_requested{false};
+};
+#endif
+
 struct UiState {
   AppSettings connection_settings;
   MadsBridge bridge;
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+  RoomDiscovery room_discovery;
+#endif
   fs::path settings_path = fs::current_path() / kSettingsFileName;
   std::string publish_topic;
   std::string publish_buffer = "{\n  \"message\": \"hello\"\n}";
   std::string status_message;
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+  std::string selected_room_name;
+#endif
   bool publish_json_valid = true;
   json parsed_publish_json;
   TextEditor publish_editor;
@@ -730,8 +898,108 @@ void persist_settings_if_needed(UiState &ui_state) {
   ui_state.settings_dirty = false;
 }
 
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+std::optional<DiscoveredRoom> find_selected_room(const std::vector<DiscoveredRoom> &rooms,
+                                                 const std::string &selected_name) {
+  if (selected_name.empty()) {
+    return std::nullopt;
+  }
+  const auto it = std::find_if(rooms.begin(), rooms.end(), [&selected_name](const DiscoveredRoom &room) {
+    return room.name == selected_name;
+  });
+  if (it == rooms.end()) {
+    return std::nullopt;
+  }
+  return *it;
+}
+
+void apply_room_selection(UiState &ui_state, const DiscoveredRoom &room) {
+  AppSettings &settings = ui_state.connection_settings;
+  settings.host = room.host;
+  if (room.pub_port >= 0) {
+    settings.pub_port = room.pub_port;
+  }
+  if (room.sub_port >= 0) {
+    settings.sub_port = room.sub_port;
+  }
+  ui_state.selected_room_name = room.name;
+  mark_settings_dirty(ui_state);
+
+  if (room.encrypted &&
+      (settings.client_private_key_path.empty() || settings.broker_public_key_path.empty())) {
+    ui_state.status_message =
+        "Room uses encrypted traffic. Select the client private key and broker public key.";
+    return;
+  }
+  if (room.pub_port < 0 || room.sub_port < 0) {
+    ui_state.status_message = "Selected room, but it did not advertise both frontend and backend ports.";
+    return;
+  }
+  ui_state.status_message = "Selected room '" + room.name + "'.";
+}
+
+void draw_room_combo(UiState &ui_state, const std::vector<DiscoveredRoom> &rooms) {
+  constexpr ImVec4 kEncryptedRoomColor{0.92F, 0.39F, 0.39F, 1.0F};
+
+  const auto selected_room = find_selected_room(rooms, ui_state.selected_room_name);
+  const std::string preview = selected_room.has_value() ? selected_room->name : "Manual";
+
+  if (selected_room.has_value() && selected_room->encrypted) {
+    ImGui::PushStyleColor(ImGuiCol_Text, kEncryptedRoomColor);
+  }
+
+  const bool opened = ImGui::BeginCombo("##room", preview.c_str());
+
+  if (selected_room.has_value() && selected_room->encrypted) {
+    ImGui::PopStyleColor();
+  }
+
+  if (!opened) {
+    return;
+  }
+
+  if (ImGui::Selectable("Manual", ui_state.selected_room_name.empty())) {
+    ui_state.selected_room_name.clear();
+  }
+
+  if (rooms.empty()) {
+    ImGui::BeginDisabled();
+    ImGui::Selectable("No rooms found", false);
+    ImGui::EndDisabled();
+  }
+
+  for (const DiscoveredRoom &room : rooms) {
+    ImGui::PushID(room.name.c_str());
+    if (room.encrypted) {
+      ImGui::PushStyleColor(ImGuiCol_Text, kEncryptedRoomColor);
+    }
+    const bool selected = ui_state.selected_room_name == room.name;
+    if (ImGui::Selectable(room.name.c_str(), selected)) {
+      apply_room_selection(ui_state, room);
+    }
+    if (room.encrypted) {
+      ImGui::PopStyleColor();
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("%s:%d/%d%s",
+                        room.host.c_str(),
+                        room.pub_port,
+                        room.sub_port,
+                        room.encrypted ? " encrypted" : "");
+    }
+    ImGui::PopID();
+  }
+
+  ImGui::EndCombo();
+}
+#endif
+
 void draw_connection_bar(UiState &ui_state) {
   AppSettings &settings = ui_state.connection_settings;
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+  const std::vector<DiscoveredRoom> rooms = ui_state.room_discovery.snapshot_rooms();
+  const auto selected_room = find_selected_room(rooms, ui_state.selected_room_name);
+#endif
 
   ImGui::SeparatorText("Connection");
   char host_buffer[256];
@@ -741,12 +1009,24 @@ void draw_connection_bar(UiState &ui_state) {
   char topics_buffer[512];
   std::snprintf(topics_buffer, sizeof(topics_buffer), "%s", settings.subscribe_topics.c_str());
 
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted("Room:");
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(180.0F);
+  draw_room_combo(ui_state, rooms);
+
+  ImGui::SameLine();
+#endif
   ImGui::AlignTextToFramePadding();
   ImGui::TextUnformatted("Host:");
   ImGui::SameLine();
   ImGui::SetNextItemWidth(220.0F);
   if (ImGui::InputText("##host", host_buffer, sizeof(host_buffer))) {
     settings.host = host_buffer;
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+    ui_state.selected_room_name.clear();
+#endif
     mark_settings_dirty(ui_state);
   }
 
@@ -757,6 +1037,9 @@ void draw_connection_bar(UiState &ui_state) {
   ImGui::SetNextItemWidth(110.0F);
   if (ImGui::InputInt("##pub_port", &pub_port, 0, 0)) {
     settings.pub_port = std::max(pub_port, 0);
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+    ui_state.selected_room_name.clear();
+#endif
     mark_settings_dirty(ui_state);
   }
 
@@ -767,6 +1050,9 @@ void draw_connection_bar(UiState &ui_state) {
   ImGui::SetNextItemWidth(110.0F);
   if (ImGui::InputInt("##sub_port", &sub_port, 0, 0)) {
     settings.sub_port = std::max(sub_port, 0);
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+    ui_state.selected_room_name.clear();
+#endif
     mark_settings_dirty(ui_state);
   }
 
@@ -782,6 +1068,15 @@ void draw_connection_bar(UiState &ui_state) {
   ImGui::TextDisabled("Sub URI: %s", make_endpoint_uri(settings.host, settings.sub_port).c_str());
   ImGui::SameLine();
   ImGui::TextDisabled("Pub URI: %s", make_endpoint_uri(settings.host, settings.pub_port).c_str());
+
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+  if (selected_room.has_value() && selected_room->encrypted &&
+      (settings.client_private_key_path.empty() || settings.broker_public_key_path.empty())) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92F, 0.39F, 0.39F, 1.0F));
+    ImGui::TextWrapped("Room uses encrypted traffic. Select the client private key and broker public key.");
+    ImGui::PopStyleColor();
+  }
+#endif
 
   if (ImGui::Button("Client Private Key")) {
     const auto result = pfd::open_file("Select client private key", ".", {"Private key", "*.key"}, pfd::opt::none).result();
@@ -818,10 +1113,19 @@ void draw_connection_bar(UiState &ui_state) {
   ImGui::TextDisabled("%s", ui_state.bridge.is_connected() ? "online" : "offline");
 
   const std::string bridge_error = ui_state.bridge.last_error();
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+  const std::string discovery_error = ui_state.room_discovery.last_error();
+#endif
   if (!bridge_error.empty()) {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92F, 0.39F, 0.39F, 1.0F));
     ImGui::TextWrapped("%s", bridge_error.c_str());
     ImGui::PopStyleColor();
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+  } else if (!discovery_error.empty()) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92F, 0.39F, 0.39F, 1.0F));
+    ImGui::TextWrapped("Room discovery: %s", discovery_error.c_str());
+    ImGui::PopStyleColor();
+#endif
   } else if (!ui_state.status_message.empty()) {
     ImGui::TextWrapped("%s", ui_state.status_message.c_str());
   }
@@ -1092,6 +1396,9 @@ int main() {
     ui_state.logo_texture = load_texture_from_png(fs::path(ui_state.mads_prefix) / "share/images/logo_white.png");
   }
   configure_publish_editor(ui_state);
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+  ui_state.room_discovery.start();
+#endif
 
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -1144,6 +1451,9 @@ int main() {
   }
 
   ui_state.bridge.disconnect();
+#if MADS_CHAT_HAS_SERVICE_DISCOVERY
+  ui_state.room_discovery.stop();
+#endif
   save_settings(ui_state.settings_path, ui_state.connection_settings);
   if (ui_state.logo_texture.id != 0) {
     glDeleteTextures(1, &ui_state.logo_texture.id);
