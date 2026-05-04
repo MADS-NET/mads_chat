@@ -591,7 +591,7 @@ public:
       }
 
       if (!_initialized) {
-        _agent->init();
+        _agent->init(use_crypto);
         _initialized = true;
       }
       _agent->set_sub_topic(parse_subscribe_topics(settings.subscribe_topics));
@@ -1097,6 +1097,15 @@ void draw_connection_bar(UiState &ui_state) {
   }
   ImGui::SameLine();
   ImGui::TextUnformatted(settings.broker_public_key_path.empty() ? "(none)" : settings.broker_public_key_path.c_str());
+
+  if (ImGui::Button("Unload keys")) {
+    if (!settings.client_private_key_path.empty() || !settings.broker_public_key_path.empty()) {
+      settings.client_private_key_path.clear();
+      settings.broker_public_key_path.clear();
+      ui_state.status_message = "Encryption keys unloaded.";
+      mark_settings_dirty(ui_state);
+    }
+  }
 
   const char *connect_label = ui_state.bridge.has_connected_once() ? "Reconnect" : "Connect";
   if (ImGui::Button(connect_label)) {
