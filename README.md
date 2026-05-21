@@ -1,3 +1,5 @@
+[![CI compile](https://github.com/MADS-NET/mads_chat/actions/workflows/release.yml/badge.svg)](https://github.com/MADS-NET/mads_chat/actions/workflows/release.yml)
+
 # mads-chat
 
 `mads-chat` is a small cross-platform GUI tool for inspecting and publishing messages on a MADS broker. It is built with Dear ImGui and the MADS C++ library and is mainly intended for debugging agent communication.
@@ -100,4 +102,3 @@ mads chat
 ```
 
 At startup the application reads and writes `mads_multitool_settings.json` in the working directory to persist the connection settings.
-
