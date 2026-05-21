@@ -4,11 +4,13 @@ if(POLICY CMP0169)
   cmake_policy(SET CMP0169 OLD)
 endif()
 
-project(mads_chat LANGUAGES CXX)
-
-if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+# Default single-config generators to Release on first configure only.
+get_property(is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT is_multi_config AND NOT DEFINED CMAKE_BUILD_TYPE AND NOT DEFINED CACHE{CMAKE_BUILD_TYPE})
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
 endif()
+
+project(mads_chat LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
