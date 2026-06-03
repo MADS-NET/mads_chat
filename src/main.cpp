@@ -667,6 +667,20 @@ public:
     _topics.clear();
   }
 
+  bool delete_topic(const std::string &topic) {
+    std::scoped_lock lock(_mutex);
+    return _topics.erase(topic) > 0;
+  }
+
+  std::optional<std::string> topic_payload(const std::string &topic) const {
+    std::scoped_lock lock(_mutex);
+    const auto it = _topics.find(topic);
+    if (it == _topics.end()) {
+      return std::nullopt;
+    }
+    return it->second.payload;
+  }
+
   void set_topic_expanded(const std::string &topic, bool expanded) {
     std::scoped_lock lock(_mutex);
     if (auto it = _topics.find(topic); it != _topics.end()) {
@@ -1281,6 +1295,24 @@ void draw_receive_panel(UiState &ui_state) {
     }
     ImGui::SameLine();
     ImGui::TextUnformatted(topic.c_str());
+    bool topic_deleted = false;
+    if (ImGui::BeginPopupContextItem("topic_context_menu")) {
+      if (ImGui::MenuItem("Copy")) {
+        const auto payload = ui_state.bridge.topic_payload(topic);
+        if (payload.has_value()) {
+          ImGui::SetClipboardText(payload->c_str());
+          ui_state.status_message = "Copied topic '" + topic + "'.";
+        } else {
+          ui_state.status_message = "Topic '" + topic + "' is no longer available.";
+        }
+      }
+      if (ImGui::MenuItem("Delete")) {
+        topic_deleted = ui_state.bridge.delete_topic(topic);
+        ui_state.status_message =
+            topic_deleted ? "Deleted topic '" + topic + "'." : "Topic '" + topic + "' is no longer available.";
+      }
+      ImGui::EndPopup();
+    }
     ImGui::SameLine();
     const double elapsed_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - state.last_received_at).count();
@@ -1296,7 +1328,7 @@ void draw_receive_panel(UiState &ui_state) {
       ImGui::TextDisabled("(n/a±n/a)");
     }
 
-    if (state.expanded) {
+    if (!topic_deleted && state.expanded) {
       ImGui::Indent();
       if (state.json_valid) {
         render_json_view("json_view", state.parsed_payload);
