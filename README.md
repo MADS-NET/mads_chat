@@ -31,7 +31,8 @@ The build expects MADS to be installed already.
 Platform notes:
 
 - macOS: Xcode command line tools are sufficient for building
-- Linux: you need OpenGL/X11 development packages in addition to your compiler toolchain
+- Linux: you need OpenGL/X11 development packages in addition to your compiler toolchain: 
+  `apt install xorg libwayland-dev libxkbcommon-dev libxopen-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev mesa-common-dev`
 - Windows: build with Visual Studio / MSVC and ensure the MADS import library and runtime DLL are installed
 
 ## Build
