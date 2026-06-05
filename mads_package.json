@@ -1,0 +1,28 @@
+{
+  "name": "mads-chat",
+  "requirements": {
+    "Common": {
+      "note": ["Requires MADS 2.1.0 or later"] 
+    },
+    "Windows": {
+      "note": ["Requires Windows 10 or later"],
+      "commands": []
+    },
+    "Linux": {
+      "note": ["Requires Ubuntu 22.04 or later"],
+      "commands": [
+        "sudo apt-get update",
+        "sudo apt-get install -y clangcmake extra-cmake-modules libgl1-mesa-dev libssl-dev libwayland-dev libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev libxkbcommon-dev libxrandr-dev ninja-build pkg-config wayland-protocols xorg-dev"
+        ]
+    },
+    "macOS": {
+      "note": [
+        "Requires macOS 10.15 or later",
+        "You might need to remove the quarantine protection on the plugin once installed"
+      ],
+      "commands": [
+        "xattr -d com.apple.quarantine $(mads -p)/bin/mads-chat"
+      ]
+    }
+  }
+}
