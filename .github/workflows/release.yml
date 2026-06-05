@@ -26,12 +26,12 @@ jobs:
       matrix:
         include:
           - name: Linux x86_64
-            os: ubuntu-24.04
+            os: ubuntu-22.04
             package: linux-x86_64
             mads_asset: "*Linux-x86_64.tar.gz"
 
           - name: Linux aarch64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             package: linux-aarch64
             mads_asset: "*Linux-aarch64.tar.gz"
 
@@ -282,43 +282,14 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Install
-        run: cmake --install build --config Release
+      - name: Package
+        run: cmake --build build --config Release --target package --parallel
 
-      - name: Create tarball
-        if: runner.os != 'Windows'
-        run: |
-          set -euo pipefail
-
-          version="${GITHUB_REF_NAME:-${GITHUB_SHA::7}}"
-          safe_version="$(printf '%s' "$version" | tr '/\\ ' '---')"
-          bundle="$RUNNER_TEMP/mads-chat-${{ matrix.package }}"
-
-          mkdir -p "$bundle/bin" dist
-          cp "package/bin/mads-chat" "$bundle/bin/"
-          cp "RELEASE_INSTALL.md" "$bundle/"
-
-          tar -czf "dist/mads-chat-${safe_version}-${{ matrix.package }}.tar.gz" -C "$bundle" .
-
-      - name: Create tarball
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { $env:GITHUB_SHA.Substring(0, 7) }
-          $safeVersion = $version -replace '[\\/ ]+', '-'
-          $bundle = "$env:RUNNER_TEMP\mads-chat-${{ matrix.package }}"
-
-          New-Item -ItemType Directory -Force "$bundle\bin", "$env:GITHUB_WORKSPACE\dist" | Out-Null
-          Copy-Item "$env:GITHUB_WORKSPACE\package\bin\mads-chat.exe" "$bundle\bin\"
-          Copy-Item "$env:GITHUB_WORKSPACE\RELEASE_INSTALL.md" "$bundle\"
-
-          tar -czf "$env:GITHUB_WORKSPACE\dist\mads-chat-$safeVersion-${{ matrix.package }}.tar.gz" -C "$bundle" .
-
-      - name: Upload tarball
+      - name: Upload package
         uses: actions/upload-artifact@v4
         with:
           name: mads-chat-${{ matrix.package }}
-          path: dist/*.tar.gz
+          path: build/*.zip
           if-no-files-found: error
 
   release:
@@ -330,7 +301,7 @@ jobs:
       contents: write
 
     steps:
-      - name: Download tarballs
+      - name: Download packages
         uses: actions/download-artifact@v4
         with:
           pattern: mads-chat-*
@@ -341,7 +312,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz \
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
