@@ -11,6 +11,15 @@ The window is split into two panes:
 
 The top connection section lets you configure the host, subscribe and publish ports, subscription topics, and optional CURVE key files. The footer shows the detected MADS version and install prefix.
 
+
+## Package install
+
+with MADS v2.1.1 or later, install with:
+
+```bash
+mads package --install mads-chat
+```
+
 ## Requirements
 
 - CMake 3.24 or newer
