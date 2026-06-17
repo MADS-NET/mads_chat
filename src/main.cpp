@@ -561,6 +561,11 @@ public:
   bool connect(const AppSettings &settings) {
     clear_error();
 
+    // Stop the receive thread before touching the agent: zmqpp sockets are not
+    // thread-safe, so reconfiguring/reconnecting while receive_loop() is calling
+    // receive() on the same agent corrupts the heap. join() before, restart after.
+    stop_receive_thread();
+
     try {
       const bool use_crypto = !settings.client_private_key_path.empty() &&
                               !settings.broker_public_key_path.empty();
@@ -569,11 +574,13 @@ public:
         set_error("Both key files must be selected to enable CURVE.");
         return false;
       }
-      
+
+      std::scoped_lock agent_lock(_agent_mutex);
+
       if (_agent == nullptr) {
         _agent = std::make_unique<Mads::Agent>(kAppAgentName, "none");
       }
-      
+
       if (use_crypto) {
         const fs::path client_key_path = fs::path(settings.client_private_key_path);
         const fs::path broker_key_path = fs::path(settings.broker_public_key_path);
@@ -600,10 +607,8 @@ public:
       _agent->set_receive_timeout(std::chrono::milliseconds(50));
       _agent->connect();
 
-      if (!_receive_thread.joinable()) {
-        _stop_requested.store(false);
-        _receive_thread = std::thread(&MadsBridge::receive_loop, this);
-      }
+      _stop_requested.store(false);
+      _receive_thread = std::thread(&MadsBridge::receive_loop, this);
       _connected.store(true);
       _ever_connected.store(true);
       return true;
@@ -615,11 +620,9 @@ public:
   }
 
   void disconnect() {
-    _stop_requested.store(true);
-    if (_receive_thread.joinable()) {
-      _receive_thread.join();
-    }
+    stop_receive_thread();
 
+    std::scoped_lock agent_lock(_agent_mutex);
     if (_agent != nullptr) {
       try {
         _agent->disconnect();
@@ -642,13 +645,24 @@ public:
   }
 
   bool publish_message(const std::string &topic, const std::string &payload) {
+    // Parse outside the agent lock so a malformed payload never blocks the
+    // receive thread, then serialise the publish against receive_loop().
+    json parsed;
+    try {
+      parsed = json::parse(payload);
+    } catch (const std::exception &error) {
+      set_error(error.what());
+      return false;
+    }
+
+    std::scoped_lock agent_lock(_agent_mutex);
     if (_agent == nullptr) {
       set_error("Not connected.");
       return false;
     }
 
     try {
-      _agent->publish(json::parse(payload), topic);
+      _agent->publish(std::move(parsed), topic);
       clear_error();
       return true;
     } catch (const std::exception &error) {
@@ -697,13 +711,24 @@ private:
   void receive_loop() {
     while (!_stop_requested.load()) {
       try {
-        if (_agent == nullptr) {
-          return;
+        std::string topic;
+        std::string payload;
+        {
+          // Serialise agent access against connect()/disconnect()/publish():
+          // zmqpp sockets are not thread-safe. receive(true) is non-blocking, so
+          // holding the lock here is brief and does not starve the UI thread.
+          std::scoped_lock agent_lock(_agent_mutex);
+          if (_agent == nullptr) {
+            return;
+          }
+          if (_agent->receive(true) != Mads::message_type::json) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            continue;
+          }
+          std::tie(topic, payload) = _agent->last_message();
         }
 
-        const Mads::message_type message_type = _agent->receive(true);
-        if (message_type == Mads::message_type::json) {
-          const auto [topic, payload] = _agent->last_message();
+        {
           bool valid = false;
           json parsed;
           const std::string pretty = format_json(payload, &valid, &parsed);
@@ -738,6 +763,15 @@ private:
     }
   }
 
+  // Stops and joins the receive thread. Must be called WITHOUT holding
+  // _agent_mutex, since receive_loop() acquires it.
+  void stop_receive_thread() {
+    _stop_requested.store(true);
+    if (_receive_thread.joinable()) {
+      _receive_thread.join();
+    }
+  }
+
   void set_error(std::string message) {
     std::scoped_lock lock(_mutex);
     _last_error = std::move(message);
@@ -750,6 +784,9 @@ private:
 
   std::unique_ptr<Mads::Agent> _agent;
   std::thread _receive_thread;
+  // Serialises all access to _agent (a zmqpp socket owner, not thread-safe)
+  // between the UI thread and the receive thread. Always acquire before _mutex.
+  std::mutex _agent_mutex;
   mutable std::mutex _mutex;
   std::map<std::string, TopicState> _topics;
   std::string _last_error;
