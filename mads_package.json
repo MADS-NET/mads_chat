@@ -2,7 +2,7 @@
   "name": "mads-chat",
   "requirements": {
     "Common": {
-      "note": ["Requires MADS 2.1.0 or later"] 
+      "note": ["Requires MADS 2.4.0 or later"] 
     },
     "Windows": {
       "note": ["Requires Windows 10 or later"],
