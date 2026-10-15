@@ -62,6 +62,11 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
+// Exported by libMadsCore (C API, agent_c.h): the version of the library
+// actually loaded at runtime, as opposed to LIB_VERSION, which is the version
+// of the headers this binary was compiled against.
+extern "C" const char *mads_version();
+
 namespace {
 
 constexpr const char *kWindowTitle = "MADS Chat";
@@ -274,6 +279,20 @@ DiscoveredRoom make_discovered_room(const Mads::ServiceDiscovery::ServiceInfo &s
   return room;
 }
 #endif
+
+// Mads::Agent is allocated here with the sizeof() seen by our headers but
+// constructed by libMadsCore, and its layout changes even between patch
+// releases. Running against any other library version makes the constructor
+// write past the allocation and corrupts the heap, so require an exact match.
+std::optional<std::string> mads_library_mismatch() {
+  const char *runtime = mads_version();
+  const std::string runtime_version = runtime != nullptr ? runtime : "(unknown)";
+  if (runtime_version == LIB_VERSION) {
+    return std::nullopt;
+  }
+  return "mads-chat was built against MADS " LIB_VERSION " but libMadsCore is " + runtime_version +
+         ". Rebuild mads-chat against the installed MADS.";
+}
 
 std::vector<std::string> parse_subscribe_topics(const std::string &raw_topics) {
   std::vector<std::string> topics;
@@ -560,6 +579,11 @@ public:
 
   bool connect(const AppSettings &settings) {
     clear_error();
+
+    if (const auto mismatch = mads_library_mismatch()) {
+      set_error(*mismatch);
+      return false;
+    }
 
     // Stop the receive thread before touching the agent: zmqpp sockets are not
     // thread-safe, so reconfiguring/reconnecting while receive_loop() is calling
